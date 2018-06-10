@@ -9,18 +9,32 @@ import java.io.InputStreamReader
 import java.io.OutputStream
 import java.util.*
 
-class KAExperiment(portNames: List<String>, baudRate: Int, timeout: Int, private val collectorFn: (String) -> Unit): AutoCloseable {
+data class KAExperimentConfig(val portNames: List<String>, val baudRate: Int, val timeout: Int, val eventHandling: IKAExperimentEventDSL.() -> Unit)
+
+class KAExperimentGenerator(private val config: KAExperimentConfig) {
+    fun start() = KAExperimentStarted(config)
+}
+
+class KAExperimentStarted(private val config: KAExperimentConfig): AutoCloseable {
     private val serialPort: SerialPort
     private val input: BufferedReader
     private val output: OutputStream
     private val serialEventListener: SerialPortEventListener
+    private var collectorFn: (String) -> Unit = {}
+    private var errorFn: (Exception) -> Unit = {}
+
+    fun stop(): KAExperimentGenerator {
+        close()
+
+        return KAExperimentGenerator(config)
+    }
 
     init {
-        val matchingPort = listAllPorts().find { portNames.contains(it.name) } ?: throw KAExperiment.NoMatchingPortException()
+        val matchingPort = listAllPorts().find { config.portNames.contains(it.name) } ?: throw KAExperimentStarted.NoMatchingPortException()
 
         try {
-            serialPort = matchingPort.open(this::class.java.name, timeout) as SerialPort
-            serialPort.setSerialPortParams(baudRate,
+            serialPort = matchingPort.open(this::class.java.name, config.timeout) as SerialPort
+            serialPort.setSerialPortParams(config.baudRate,
                     SerialPort.DATABITS_8,
                     SerialPort.STOPBITS_1,
                     SerialPort.PARITY_NONE)
@@ -34,8 +48,17 @@ class KAExperiment(portNames: List<String>, baudRate: Int, timeout: Int, private
             serialPort.notifyOnDataAvailable(true)
 
         } catch (e: Exception) {
-            throw KAExperiment.CouldNotInitializeException()
+            throw KAExperimentStarted.CouldNotInitializeException()
         }
+
+        val dsl = KAExperimentEventDSL()
+        config.eventHandling(dsl);
+        dsl.terminate()
+    }
+
+    override fun close() {
+        serialPort.removeEventListener()
+        serialPort.close()
     }
 
     private fun handleSerialEvent(oEvent: SerialPortEvent) {
@@ -49,8 +72,7 @@ class KAExperiment(portNames: List<String>, baudRate: Int, timeout: Int, private
             }
 
         } catch (e: Exception) {
-            e.printStackTrace()
-            //errorFn()
+            errorFn(e)
         }
     }
 
@@ -59,8 +81,28 @@ class KAExperiment(portNames: List<String>, baudRate: Int, timeout: Int, private
     class NoMatchingPortException : RuntimeException()
     class CouldNotInitializeException : RuntimeException()
 
-    override fun close() {
-        serialPort.removeEventListener()
-        serialPort.close()
+    inner class KAExperimentEventDSL : IKAExperimentEventDSL {
+        private var terminated = false
+
+        override fun onMessage(handler: (message: String) -> Unit) {
+            if (terminated) throw IllegalStateException()
+
+            collectorFn = handler;
+        }
+
+        override fun onError(handler: (exception: Exception) -> Unit) {
+            if (terminated) throw IllegalStateException()
+
+            errorFn = handler
+        }
+
+        fun terminate() {
+            terminated = true
+        }
     }
+}
+
+interface IKAExperimentEventDSL {
+    fun onMessage(handler: (String) -> Unit)
+    fun onError(handler: (Exception) -> Unit)
 }
